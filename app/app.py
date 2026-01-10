@@ -5,7 +5,7 @@ import logging
 from app.config import settings
 from app.integrations.mongodb import connect_db, close_db
 from app.integrations.gemini import init_gemini
-from app.api import health
+from app.api import health, webhook
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +41,7 @@ app = FastAPI(
 
 # Include routers
 app.include_router(health.router, tags=["health"])
+app.include_router(webhook.router, prefix="/webhook", tags=["webhook"])
 
 
 @app.get("/")

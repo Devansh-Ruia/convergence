@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
+from bson import ObjectId
 from app.config import settings
 from app.models.session import ReviewSession, GitHubContext, FileChange
 from app.integrations.mongodb import get_db
 from app.integrations import github
+from app.agents import run_all_agents
 from datetime import datetime
 import hmac
 import hashlib
@@ -175,6 +177,102 @@ async def test_pr_review(owner: str, repo: str, pr_number: int):
     }
 
 
+@router.post("/sessions/{session_id}/analyze")
+async def analyze_session(session_id: str):
+    """
+    Manually trigger agent analysis for a session.
+    Runs all 3 agents (security, performance, testing) in parallel.
+    """
+    db = get_db()
+    
+    try:
+        session = await db.review_sessions.find_one({"_id": ObjectId(session_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID format")
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Check if already analyzed
+    if session.get("status") in ["analyzing", "converging", "complete"]:
+        return {
+            "status": "already_processing",
+            "session_id": session_id,
+            "current_status": session.get("status")
+        }
+    
+    # Convert files back to FileChange objects
+    files = [FileChange(**f) for f in session.get("files", [])]
+    
+    if not files:
+        return {"status": "skipped", "reason": "No files to analyze"}
+    
+    # Run all agents in parallel
+    results = await run_all_agents(
+        session_id=session_id,
+        repo_owner=session["github"]["repo_owner"],
+        repo_name=session["github"]["repo_name"],
+        pr_title=session["github"]["pr_title"],
+        files=files
+    )
+    
+    # Calculate totals
+    total_findings = sum(len(data.get("findings", [])) for data in results.values())
+    
+    return {
+        "status": "completed",
+        "session_id": session_id,
+        "agents": list(results.keys()),
+        "findings_count": {
+            agent: len(data.get("findings", []))
+            for agent, data in results.items()
+        },
+        "total_findings": total_findings,
+        "summaries": {
+            agent: data.get("summary", "")
+            for agent, data in results.items()
+        }
+    }
+
+
+@router.get("/sessions/{session_id}/findings")
+async def get_session_findings(session_id: str):
+    """Get all agent findings for a session."""
+    db = get_db()
+    
+    try:
+        oid = ObjectId(session_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID format")
+    
+    # Get session
+    session = await db.review_sessions.find_one({"_id": oid})
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Get all findings
+    cursor = db.agent_findings.find({"session_id": oid})
+    findings_docs = await cursor.to_list(length=10)
+    
+    # Format response
+    findings_by_agent = {}
+    for doc in findings_docs:
+        agent_type = doc["agent_type"]
+        findings_by_agent[agent_type] = {
+            "findings": doc.get("findings", []),
+            "summary": doc.get("summary", ""),
+            "latency_ms": doc.get("latency_ms", 0)
+        }
+    
+    return {
+        "session_id": session_id,
+        "status": session.get("status"),
+        "pr_title": session["github"]["pr_title"],
+        "agents_completed": session.get("agents_completed", []),
+        "findings_by_agent": findings_by_agent
+    }
+
+
 @router.get("/sessions")
 async def list_sessions(limit: int = 10):
     """List recent review sessions."""
@@ -183,20 +281,32 @@ async def list_sessions(limit: int = 10):
     cursor = db.review_sessions.find().sort("created_at", -1).limit(limit)
     sessions = await cursor.to_list(length=limit)
     
-    # Convert ObjectId to string
+    # Convert ObjectId to string and simplify
+    result = []
     for s in sessions:
-        s["_id"] = str(s["_id"])
+        result.append({
+            "_id": str(s["_id"]),
+            "pr_title": s["github"]["pr_title"],
+            "pr_number": s["github"]["pr_number"],
+            "repo": f"{s['github']['repo_owner']}/{s['github']['repo_name']}",
+            "status": s.get("status", "unknown"),
+            "files_count": len(s.get("files", [])),
+            "agents_completed": s.get("agents_completed", []),
+            "created_at": s.get("created_at")
+        })
     
-    return {"sessions": sessions}
+    return {"sessions": result}
 
 
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str):
     """Get a specific session by ID."""
-    from bson import ObjectId
-    
     db = get_db()
-    session = await db.review_sessions.find_one({"_id": ObjectId(session_id)})
+    
+    try:
+        session = await db.review_sessions.find_one({"_id": ObjectId(session_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID format")
     
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")

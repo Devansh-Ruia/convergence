@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Convergence Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+    <style>
+        @keyframes pulse-ring {
+            0% { transform: scale(0.8); opacity: 1; }
+            100% { transform: scale(1.4); opacity: 0; }
+        }
+        .pulse-ring::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            border: 2px solid currentColor;
+            animation: pulse-ring 1.5s ease-out infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .animate-spin { animation: spin 1s linear infinite; }
+        .bg-grid {
+            background-image: radial-gradient(circle, #374151 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback } = React;
+        
+        const API_BASE = 'http://localhost:8000';
+        
+        // Agent config
+        const AGENTS = {
+            security: { icon: '🔒', color: 'red', label: 'Security' },
+            performance: { icon: '⚡', color: 'yellow', label: 'Performance' },
+            testing: { icon: '🧪', color: 'blue', label: 'Testing' }
+        };
+        
+        // Status badge component
+        function StatusBadge({ status }) {
+            const styles = {
+                pending: 'bg-gray-600 text-gray-200',
+                analyzing: 'bg-yellow-600 text-yellow-100 animate-pulse',
+                converging: 'bg-purple-600 text-purple-100 animate-pulse',
+                complete: 'bg-green-600 text-green-100',
+                failed: 'bg-red-600 text-red-100'
+            };
+            return (
+                <span className={`px-3 py-1 rounded-full text-sm font-medium ${styles[status] || styles.pending}`}>
+                    {status?.toUpperCase() || 'UNKNOWN'}
+                </span>
+            );
+        }
+        
+        // Agent card component
+        function AgentCard({ type, isDispatched, isComplete, findings, latency }) {
+            const agent = AGENTS[type];
+            const status = isComplete ? 'complete' : isDispatched ? 'running' : 'waiting';
+            
+            return (
+                <div className={`relative p-4 rounded-xl border-2 transition-all duration-500 ${
+                    isComplete ? 'border-green-500 bg-green-900/20' :
+                    isDispatched ? 'border-yellow-500 bg-yellow-900/20' :
+                    'border-gray-700 bg-gray-800/50'
+                }`}>
+                    {/* Running indicator */}
+                    {isDispatched && !isComplete && (
+                        <div className="absolute top-2 right-2">
+                            <div className="w-3 h-3 bg-yellow-500 rounded-full animate-pulse"></div>
+                        </div>
+                    )}
+                    
+                    {/* Complete indicator */}
+                    {isComplete && (
+                        <div className="absolute top-2 right-2 text-green-500">✓</div>
+                    )}
+                    
+                    <div className="text-3xl mb-2">{agent.icon}</div>
+                    <div className="font-bold text-lg">{agent.label}</div>
+                    <div className="text-sm text-gray-400 mt-1">
+                        {isComplete ? (
+                            <>
+                                <span className="text-white font-bold">{findings}</span> findings
+                                <br/>
+                                <span className="text-gray-500">{latency}ms</span>
+                            </>
+                        ) : isDispatched ? (
+                            <span className="text-yellow-400">Analyzing...</span>
+                        ) : (
+                            <span className="text-gray-500">Waiting</span>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+        
+        // Finding item component
+        function FindingItem({ finding }) {
+            const sevColors = {
+                5: 'border-red-500 bg-red-900/30',
+                4: 'border-orange-500 bg-orange-900/30',
+                3: 'border-yellow-500 bg-yellow-900/30',
+                2: 'border-blue-500 bg-blue-900/30',
+                1: 'border-gray-500 bg-gray-800/30'
+            };
+            const sevIcons = { 5: '🔴', 4: '🟠', 3: '🟡', 2: '🔵', 1: '⚪' };
+            
+            return (
+                <div className={`p-3 rounded-lg border-l-4 ${sevColors[finding.severity] || sevColors[3]} mb-2`}>
+                    <div className="flex items-start gap-2">
+                        <span>{sevIcons[finding.severity]}</span>
+                        <div className="flex-1">
+                            <div className="font-medium">{finding.title}</div>
+                            <div className="text-sm text-gray-400 mt-1">
+                                📁 {finding.file_path}:{finding.line_start}
+                            </div>
+                            {finding._sources && (
+                                <div className="text-xs text-purple-400 mt-1">
+                                    ⚡ Flagged by: {finding._sources.join(', ')}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+        
+        // Main Dashboard
+        function Dashboard() {
+            const [sessions, setSessions] = useState([]);
+            const [activeSession, setActiveSession] = useState(null);
+            const [sessionDetail, setSessionDetail] = useState(null);
+            const [findings, setFindings] = useState({});
+            const [polling, setPolling] = useState(false);
+            const [prInput, setPrInput] = useState({ owner: '', repo: '', pr_number: '' });
+            const [loading, setLoading] = useState(false);
+            const [error, setError] = useState(null);
+            
+            // Fetch sessions list
+            const fetchSessions = useCallback(async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/webhook/sessions?limit=10`);
+                    const data = await res.json();
+                    setSessions(data.sessions || []);
+                } catch (e) {
+                    console.error('Failed to fetch sessions:', e);
+                }
+            }, []);
+            
+            // Fetch session detail
+            const fetchSessionDetail = useCallback(async (sessionId) => {
+                try {
+                    const res = await fetch(`${API_BASE}/webhook/sessions/${sessionId}`);
+                    const data = await res.json();
+                    setSessionDetail(data);
+                    
+                    // Fetch findings if agents completed
+                    if (data.agents_completed?.length > 0) {
+                        const findingsRes = await fetch(`${API_BASE}/webhook/sessions/${sessionId}/findings`);
+                        const findingsData = await findingsRes.json();
+                        setFindings(findingsData.findings_by_agent || {});
+                    }
+                    
+                    return data;
+                } catch (e) {
+                    console.error('Failed to fetch session:', e);
+                    return null;
+                }
+            }, []);
+            
+            // Create new session
+            const createSession = async () => {
+                if (!prInput.owner || !prInput.repo || !prInput.pr_number) {
+                    setError('Please fill all fields');
+                    return;
+                }
+                
+                setLoading(true);
+                setError(null);
+                
+                try {
+                    const res = await fetch(
+                        `${API_BASE}/webhook/test-pr?owner=${prInput.owner}&repo=${prInput.repo}&pr_number=${prInput.pr_number}`,
+                        { method: 'POST' }
+                    );
+                    const data = await res.json();
+                    
+                    if (data.session_id) {
+                        setActiveSession(data.session_id);
+                        await fetchSessions();
+                        await fetchSessionDetail(data.session_id);
+                    } else {
+                        setError(data.reason || 'Failed to create session');
+                    }
+                } catch (e) {
+                    setError(e.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+            
+            // Run full review
+            const runReview = async () => {
+                if (!activeSession) return;
+                
+                setLoading(true);
+                setPolling(true);
+                
+                try {
+                    // Start polling for updates
+                    const pollInterval = setInterval(async () => {
+                        const detail = await fetchSessionDetail(activeSession);
+                        if (detail?.status === 'complete' || detail?.status === 'failed') {
+                            clearInterval(pollInterval);
+                            setPolling(false);
+                        }
+                    }, 1000);
+                    
+                    // Trigger review
+                    const res = await fetch(
+                        `${API_BASE}/webhook/sessions/${activeSession}/review?post_to_github=false`,
+                        { method: 'POST' }
+                    );
+                    const data = await res.json();
+                    
+                    clearInterval(pollInterval);
+                    setPolling(false);
+                    await fetchSessionDetail(activeSession);
+                    
+                } catch (e) {
+                    setError(e.message);
+                    setPolling(false);
+                } finally {
+                    setLoading(false);
+                }
+            };
+            
+            // Post to GitHub
+            const postToGitHub = async () => {
+                if (!activeSession) return;
+                setLoading(true);
+                
+                try {
+                    const res = await fetch(
+                        `${API_BASE}/webhook/sessions/${activeSession}/post-review`,
+                        { method: 'POST' }
+                    );
+                    const data = await res.json();
+                    
+                    if (data.github_review_id) {
+                        alert(`✅ Posted! Review ID: ${data.github_review_id}`);
+                        await fetchSessionDetail(activeSession);
+                    }
+                } catch (e) {
+                    setError(e.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+            
+            // Initial load
+            useEffect(() => {
+                fetchSessions();
+                const interval = setInterval(fetchSessions, 5000);
+                return () => clearInterval(interval);
+            }, [fetchSessions]);
+            
+            // Poll active session
+            useEffect(() => {
+                if (activeSession && polling) {
+                    const interval = setInterval(() => fetchSessionDetail(activeSession), 1000);
+                    return () => clearInterval(interval);
+                }
+            }, [activeSession, polling, fetchSessionDetail]);
+            
+            return (
+                <div className="min-h-screen bg-grid">
+                    {/* Header */}
+                    <header className="bg-gray-800/80 backdrop-blur border-b border-gray-700 p-4">
+                        <div className="max-w-7xl mx-auto flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                                <span className="text-3xl">🔍</span>
+                                <div>
+                                    <h1 className="text-2xl font-bold">Convergence</h1>
+                                    <p className="text-sm text-gray-400">Multi-Agent PR Review System</p>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-2 text-sm text-gray-400">
+                                <div className={`w-2 h-2 rounded-full ${polling ? 'bg-yellow-500 animate-pulse' : 'bg-green-500'}`}></div>
+                                {polling ? 'Processing...' : 'Ready'}
+                            </div>
+                        </div>
+                    </header>
+                    
+                    <main className="max-w-7xl mx-auto p-6">
+                        {/* Create Session Form */}
+                        <div className="bg-gray-800/50 rounded-xl p-6 mb-6 border border-gray-700">
+                            <h2 className="text-lg font-bold mb-4">📝 New Review Session</h2>
+                            <div className="flex gap-4 flex-wrap">
+                                <input
+                                    type="text"
+                                    placeholder="Owner"
+                                    value={prInput.owner}
+                                    onChange={e => setPrInput({...prInput, owner: e.target.value})}
+                                    className="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                />
+                                <input
+                                    type="text"
+                                    placeholder="Repo"
+                                    value={prInput.repo}
+                                    onChange={e => setPrInput({...prInput, repo: e.target.value})}
+                                    className="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 focus:outline-none focus:border-blue-500"
+                                />
+                                <input
+                                    type="number"
+                                    placeholder="PR #"
+                                    value={prInput.pr_number}
+                                    onChange={e => setPrInput({...prInput, pr_number: e.target.value})}
+                                    className="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 w-24 focus:outline-none focus:border-blue-500"
+                                />
+                                <button
+                                    onClick={createSession}
+                                    disabled={loading}
+                                    className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 px-6 py-2 rounded-lg font-medium transition"
+                                >
+                                    {loading ? '...' : 'Create Session'}
+                                </button>
+                            </div>
+                            {error && <p className="text-red-400 mt-2">{error}</p>}
+                        </div>
+                        
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            {/* Sessions List */}
+                            <div className="bg-gray-800/50 rounded-xl p-6 border border-gray-700">
+                                <h2 className="text-lg font-bold mb-4">📋 Recent Sessions</h2>
+                                <div className="space-y-2 max-h-96 overflow-y-auto">
+                                    {sessions.map(s => (
+                                        <div
+                                            key={s._id}
+                                            onClick={() => {
+                                                setActiveSession(s._id);
+                                                fetchSessionDetail(s._id);
+                                            }}
+                                            className={`p-3 rounded-lg cursor-pointer transition ${
+                                                activeSession === s._id
+                                                    ? 'bg-blue-600/30 border border-blue-500'
+                                                    : 'bg-gray-700/50 hover:bg-gray-700 border border-transparent'
+                                            }`}
+                                        >
+                                            <div className="flex justify-between items-start">
+                                                <div className="truncate flex-1">
+                                                    <div className="font-medium truncate">{s.pr_title}</div>
+                                                    <div className="text-sm text-gray-400">
+                                                        {s.repo} #{s.pr_number}
+                                                    </div>
+                                                </div>
+                                                <StatusBadge status={s.status} />
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {sessions.length === 0 && (
+                                        <p className="text-gray-500 text-center py-4">No sessions yet</p>
+                                    )}
+                                </div>
+                            </div>
+                            
+                            {/* Agent Status */}
+                            <div className="lg:col-span-2">
+                                {sessionDetail ? (
+                                    <div className="space-y-6">
+                                        {/* Session Header */}
+                                        <div className="bg-gray-800/50 rounded-xl p-6 border border-gray-700">
+                                            <div className="flex justify-between items-start mb-4">
+                                                <div>
+                                                    <h2 className="text-xl font-bold">{sessionDetail.github?.pr_title}</h2>
+                                                    <p className="text-gray-400">
+                                                        {sessionDetail.github?.repo_owner}/{sessionDetail.github?.repo_name} 
+                                                        #{sessionDetail.github?.pr_number}
+                                                    </p>
+                                                </div>
+                                                <StatusBadge status={sessionDetail.status} />
+                                            </div>
+                                            
+                                            <div className="flex gap-3">
+                                                <button
+                                                    onClick={runReview}
+                                                    disabled={loading || sessionDetail.status === 'complete'}
+                                                    className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 px-4 py-2 rounded-lg font-medium transition"
+                                                >
+                                                    {loading ? '⏳ Running...' : '▶️ Run Review'}
+                                                </button>
+                                                
+                                                {sessionDetail.status === 'complete' && !sessionDetail.final_review?.github_review_id && (
+                                                    <button
+                                                        onClick={postToGitHub}
+                                                        disabled={loading}
+                                                        className="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded-lg font-medium transition"
+                                                    >
+                                                        📤 Post to GitHub
+                                                    </button>
+                                                )}
+                                                
+                                                {sessionDetail.final_review?.github_review_id && (
+                                                    <span className="text-green-400 flex items-center gap-2">
+                                                        ✅ Posted to GitHub
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </div>
+                                        
+                                        {/* Agent Cards */}
+                                        <div className="grid grid-cols-3 gap-4">
+                                            {Object.keys(AGENTS).map(type => (
+                                                <AgentCard
+                                                    key={type}
+                                                    type={type}
+                                                    isDispatched={sessionDetail.agents_dispatched?.includes(type)}
+                                                    isComplete={sessionDetail.agents_completed?.includes(type)}
+                                                    findings={findings[type]?.findings?.length || 0}
+                                                    latency={findings[type]?.latency_ms || 0}
+                                                />
+                                            ))}
+                                        </div>
+                                        
+                                        {/* Findings */}
+                                        {sessionDetail.status === 'complete' && sessionDetail.final_review && (
+                                            <div className="bg-gray-800/50 rounded-xl p-6 border border-gray-700">
+                                                <h3 className="font-bold mb-4 flex items-center gap-2">
+                                                    📊 Results
+                                                    <span className="text-sm font-normal text-gray-400">
+                                                        {sessionDetail.final_review.findings_count} findings
+                                                        ({sessionDetail.final_review.critical_count} critical)
+                                                    </span>
+                                                </h3>
+                                                
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-80 overflow-y-auto">
+                                                    {Object.entries(findings).map(([agent, data]) => (
+                                                        <div key={agent}>
+                                                            <h4 className="font-medium mb-2 flex items-center gap-2">
+                                                                {AGENTS[agent]?.icon} {AGENTS[agent]?.label}
+                                                            </h4>
+                                                            {data.findings?.slice(0, 3).map((f, i) => (
+                                                                <FindingItem key={i} finding={f} />
+                                                            ))}
+                                                            {data.findings?.length > 3 && (
+                                                                <p className="text-gray-500 text-sm">
+                                                                    +{data.findings.length - 3} more
+                                                                </p>
+                                                            )}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <div className="bg-gray-800/50 rounded-xl p-12 border border-gray-700 text-center">
+                                        <div className="text-4xl mb-4">👈</div>
+                                        <p className="text-gray-400">Select a session or create a new one</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            );
+        }
+        
+        ReactDOM.render(<Dashboard />, document.getElementById('root'));
+    </script>
+</body>
+</html>

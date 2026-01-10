@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
+from fastapi.responses import PlainTextResponse
 from bson import ObjectId
 from app.config import settings
 from app.models.session import ReviewSession, GitHubContext, FileChange
 from app.integrations.mongodb import get_db
 from app.integrations import github
 from app.agents import run_all_agents
+from app.orchestrator import orchestrate_review
 from datetime import datetime
 import hmac
 import hashlib
@@ -33,66 +35,12 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
-async def process_pr_event(payload: dict) -> str:
-    """
-    Process a PR event and create a review session.
-    Returns the session ID.
-    """
-    db = get_db()
-    pr = payload["pull_request"]
-    repo = payload["repository"]
-    
-    # Create GitHub context
-    github_ctx = GitHubContext(
-        repo_owner=repo["owner"]["login"],
-        repo_name=repo["name"],
-        pr_number=pr["number"],
-        pr_title=pr["title"],
-        pr_url=pr["html_url"],
-        head_sha=pr["head"]["sha"],
-        author=pr["user"]["login"]
-    )
-    
-    # Check if session already exists for this PR
-    existing = await db.review_sessions.find_one({
-        "github.repo_owner": github_ctx.repo_owner,
-        "github.repo_name": github_ctx.repo_name,
-        "github.pr_number": github_ctx.pr_number,
-        "github.head_sha": github_ctx.head_sha
-    })
-    
-    if existing:
-        logger.info(f"Session already exists for PR #{github_ctx.pr_number} @ {github_ctx.head_sha}")
-        return str(existing["_id"])
-    
-    # Fetch PR files
-    files = await github.get_pr_files(
-        owner=github_ctx.repo_owner,
-        repo=github_ctx.repo_name,
-        pr_number=github_ctx.pr_number
-    )
-    
-    # Create session
-    session = ReviewSession(
-        github=github_ctx,
-        files=files,
-        status="pending"
-    )
-    
-    result = await db.review_sessions.insert_one(session.model_dump())
-    session_id = str(result.inserted_id)
-    
-    logger.info(f"Created session {session_id} for PR #{github_ctx.pr_number}")
-    return session_id
-
-
 @router.post("/github")
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     """Handle GitHub webhook events."""
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
     
-    # Verify signature
     if not verify_signature(body, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
     
@@ -101,7 +49,6 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     
     logger.info(f"Received GitHub event: {event_type}")
     
-    # Handle PR events
     if event_type == "pull_request":
         action = payload.get("action", "")
         pr_number = payload.get("pull_request", {}).get("number")
@@ -109,46 +56,38 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         if action in ["opened", "synchronize", "reopened"]:
             logger.info(f"Processing PR #{pr_number} (action: {action})")
             
-            # Process synchronously for now (will move to background later)
-            session_id = await process_pr_event(payload)
+            # Run full orchestration in background
+            background_tasks.add_task(
+                orchestrate_review,
+                session_id=None,
+                payload=payload,
+                post_to_github=True
+            )
             
             return {
                 "status": "processing",
                 "event": event_type,
                 "action": action,
-                "pr_number": pr_number,
-                "session_id": session_id
+                "pr_number": pr_number
             }
-        else:
-            logger.debug(f"Ignoring PR action: {action}")
     
-    return {
-        "status": "ignored",
-        "event": event_type
-    }
+    return {"status": "ignored", "event": event_type}
 
 
 @router.post("/test-pr")
 async def test_pr_review(owner: str, repo: str, pr_number: int):
     """
-    Test endpoint to manually trigger a PR review.
+    Test endpoint to create a session from a PR.
     Usage: POST /webhook/test-pr?owner=acme&repo=backend&pr_number=123
     """
     db = get_db()
     
-    # Fetch PR details
     pr_data = await github.get_pr_details(owner, repo, pr_number)
-    
-    # Fetch files
     files = await github.get_pr_files(owner, repo, pr_number)
     
     if not files:
-        return {
-            "status": "skipped",
-            "reason": "No reviewable files found"
-        }
+        return {"status": "skipped", "reason": "No reviewable files found"}
     
-    # Create session
     github_ctx = GitHubContext(
         repo_owner=owner,
         repo_name=repo,
@@ -159,12 +98,7 @@ async def test_pr_review(owner: str, repo: str, pr_number: int):
         author=pr_data["user"]["login"]
     )
     
-    session = ReviewSession(
-        github=github_ctx,
-        files=files,
-        status="pending"
-    )
-    
+    session = ReviewSession(github=github_ctx, files=files, status="pending")
     result = await db.review_sessions.insert_one(session.model_dump())
     session_id = str(result.inserted_id)
     
@@ -179,10 +113,7 @@ async def test_pr_review(owner: str, repo: str, pr_number: int):
 
 @router.post("/sessions/{session_id}/analyze")
 async def analyze_session(session_id: str):
-    """
-    Manually trigger agent analysis for a session.
-    Runs all 3 agents (security, performance, testing) in parallel.
-    """
+    """Run all agents on a session (without GitHub posting)."""
     db = get_db()
     
     try:
@@ -193,7 +124,6 @@ async def analyze_session(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    # Check if already analyzed
     if session.get("status") in ["analyzing", "converging", "complete"]:
         return {
             "status": "already_processing",
@@ -201,13 +131,11 @@ async def analyze_session(session_id: str):
             "current_status": session.get("status")
         }
     
-    # Convert files back to FileChange objects
     files = [FileChange(**f) for f in session.get("files", [])]
     
     if not files:
         return {"status": "skipped", "reason": "No files to analyze"}
     
-    # Run all agents in parallel
     results = await run_all_agents(
         session_id=session_id,
         repo_owner=session["github"]["repo_owner"],
@@ -216,7 +144,6 @@ async def analyze_session(session_id: str):
         files=files
     )
     
-    # Calculate totals
     total_findings = sum(len(data.get("findings", [])) for data in results.values())
     
     return {
@@ -227,11 +154,110 @@ async def analyze_session(session_id: str):
             agent: len(data.get("findings", []))
             for agent, data in results.items()
         },
-        "total_findings": total_findings,
-        "summaries": {
-            agent: data.get("summary", "")
-            for agent, data in results.items()
+        "total_findings": total_findings
+    }
+
+
+@router.post("/sessions/{session_id}/review")
+async def run_full_review(session_id: str, post_to_github: bool = False):
+    """
+    Run the FULL orchestration pipeline on a session.
+    - Runs all agents
+    - Merges/deduplicates findings  
+    - Generates markdown review
+    - Optionally posts to GitHub
+    
+    Usage: POST /webhook/sessions/{id}/review?post_to_github=true
+    """
+    try:
+        result = await orchestrate_review(
+            session_id=session_id,
+            post_to_github=post_to_github
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Orchestration failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/sessions/{session_id}/review-preview")
+async def preview_review(session_id: str):
+    """
+    Get the generated review markdown without posting to GitHub.
+    Useful for previewing before posting.
+    """
+    db = get_db()
+    
+    try:
+        session = await db.review_sessions.find_one({"_id": ObjectId(session_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    final_review = session.get("final_review")
+    if not final_review:
+        raise HTTPException(status_code=400, detail="Review not yet generated. Run /review first.")
+    
+    return PlainTextResponse(
+        content=final_review.get("summary", ""),
+        media_type="text/markdown"
+    )
+
+
+@router.post("/sessions/{session_id}/post-review")
+async def post_existing_review(session_id: str):
+    """
+    Post an already-generated review to GitHub.
+    Use this after previewing with /review-preview.
+    """
+    db = get_db()
+    
+    try:
+        session = await db.review_sessions.find_one({"_id": ObjectId(session_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    final_review = session.get("final_review")
+    if not final_review:
+        raise HTTPException(status_code=400, detail="Review not generated yet")
+    
+    if final_review.get("github_review_id"):
+        return {
+            "status": "already_posted",
+            "github_review_id": final_review["github_review_id"]
         }
+    
+    # Post to GitHub
+    review_markdown = final_review.get("summary", "")
+    critical_count = final_review.get("critical_count", 0)
+    event = "REQUEST_CHANGES" if critical_count > 0 else "COMMENT"
+    
+    github_ctx = session["github"]
+    github_review_id = await github.post_pr_review(
+        owner=github_ctx["repo_owner"],
+        repo=github_ctx["repo_name"],
+        pr_number=github_ctx["pr_number"],
+        body=review_markdown,
+        event=event
+    )
+    
+    # Update session
+    await db.review_sessions.update_one(
+        {"_id": ObjectId(session_id)},
+        {"$set": {"final_review.github_review_id": github_review_id}}
+    )
+    
+    return {
+        "status": "posted",
+        "github_review_id": github_review_id,
+        "pr_url": github_ctx["pr_url"]
     }
 
 
@@ -243,18 +269,15 @@ async def get_session_findings(session_id: str):
     try:
         oid = ObjectId(session_id)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid session ID format")
+        raise HTTPException(status_code=400, detail="Invalid session ID")
     
-    # Get session
     session = await db.review_sessions.find_one({"_id": oid})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    # Get all findings
     cursor = db.agent_findings.find({"session_id": oid})
     findings_docs = await cursor.to_list(length=10)
     
-    # Format response
     findings_by_agent = {}
     for doc in findings_docs:
         agent_type = doc["agent_type"]
@@ -281,7 +304,6 @@ async def list_sessions(limit: int = 10):
     cursor = db.review_sessions.find().sort("created_at", -1).limit(limit)
     sessions = await cursor.to_list(length=limit)
     
-    # Convert ObjectId to string and simplify
     result = []
     for s in sessions:
         result.append({
@@ -292,6 +314,7 @@ async def list_sessions(limit: int = 10):
             "status": s.get("status", "unknown"),
             "files_count": len(s.get("files", [])),
             "agents_completed": s.get("agents_completed", []),
+            "findings_count": s.get("final_review", {}).get("findings_count"),
             "created_at": s.get("created_at")
         })
     
@@ -300,16 +323,38 @@ async def list_sessions(limit: int = 10):
 
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str):
-    """Get a specific session by ID."""
+    """Get full session details."""
     db = get_db()
     
     try:
         session = await db.review_sessions.find_one({"_id": ObjectId(session_id)})
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid session ID format")
+        raise HTTPException(status_code=400, detail="Invalid session ID")
     
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     
     session["_id"] = str(session["_id"])
     return session
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session and its findings."""
+    db = get_db()
+    
+    try:
+        oid = ObjectId(session_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+    
+    # Delete findings
+    await db.agent_findings.delete_many({"session_id": oid})
+    
+    # Delete session
+    result = await db.review_sessions.delete_one({"_id": oid})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return {"status": "deleted", "session_id": session_id}

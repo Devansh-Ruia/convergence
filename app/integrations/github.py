@@ -73,25 +73,25 @@ async def get_pr_files(owner: str, repo: str, pr_number: int) -> list[FileChange
         files_data = response.json()
 
     files = []
-    for f in files_data:
-        filename = f.get("filename", "")
+    for file_data in files_data:
+        filename = file_data.get("filename", "")
 
+        # Skip binary files, lock files, etc.
         if not should_review_file(filename):
-            logger.debug(f"Skipping file: {filename}")
             continue
 
-        # Truncate very large patches (> 10KB)
-        patch = f.get("patch", "")
-        if len(patch) > 10000:
-            patch = patch[:10000] + "\n... [truncated]"
+        # Get patch content (truncate if too large)
+        patch = file_data.get("patch", "")
+        if len(patch) > 10240:  # 10KB limit
+            patch = patch[:10000] + "\n... (truncated for AI analysis)"
 
         files.append(
             FileChange(
                 path=filename,
-                status=f.get("status", "modified"),
+                status=file_data.get("status", "modified"),
                 patch=patch,
-                additions=f.get("additions", 0),
-                deletions=f.get("deletions", 0),
+                additions=file_data.get("additions", 0),
+                deletions=file_data.get("deletions", 0),
             )
         )
 
@@ -118,12 +118,33 @@ async def post_pr_review(
     event: COMMENT, APPROVE, or REQUEST_CHANGES
     Returns the review ID.
     """
+    from fastapi import HTTPException
+
     url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
 
     payload = {"body": body, "event": event}
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         response = await client.post(url, headers=_get_headers(), json=payload)
+
+        if response.status_code == 403:
+            logger.error(
+                f"Permission denied posting review to PR #{pr_number}: {response.text}"
+            )
+            raise HTTPException(
+                status_code=403, detail="Insufficient permissions to post review"
+            )
+        elif response.status_code == 404:
+            logger.error(
+                f"PR #{pr_number} not found or no review permissions: {response.text}"
+            )
+            raise HTTPException(
+                status_code=404, detail="PR not found or no review permissions"
+            )
+        elif response.status_code == 422:
+            logger.error(f"Invalid review data for PR #{pr_number}: {response.text}")
+            raise HTTPException(status_code=422, detail="Invalid review data")
+
         response.raise_for_status()
         data = response.json()
 

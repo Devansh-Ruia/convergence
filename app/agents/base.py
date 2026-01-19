@@ -56,7 +56,9 @@ Analyze each file carefully. Return your findings as a JSON object with this exa
       "title": "Short descriptive title",
       "description": "Detailed explanation of the issue",
       "suggestion": "How to fix this issue",
-      "code_snippet": "the problematic code"
+      "code_snippet": "the problematic code",
+      "confidence": 0.95,
+      "reasoning": "Why you are flagging this issue"
     }}
   ],
   "summary": "1-2 sentence overall assessment"
@@ -88,7 +90,9 @@ Rules:
                             "title": {"type": "string"},
                             "description": {"type": "string"},
                             "suggestion": {"type": "string"},
-                            "code_snippet": {"type": "string"}
+                            "code_snippet": {"type": "string"},
+                            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                            "reasoning": {"type": "string"}
                         },
                         "required": ["id", "file_path", "line_start", "severity", "category", "title", "description"]
                     }

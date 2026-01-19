@@ -1,5 +1,6 @@
 from collections import defaultdict
 import logging
+from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -211,13 +212,90 @@ def synthesize_markdown(
     return "\n".join(lines)
 
 
+def calculate_consensus_severity(finding: dict, cross_refs: List[Dict[str, Any]]) -> int:
+    """
+    Adjust severity based on agent consensus:
+    - 3+ agents reinforce → severity +2 (max 5)
+    - 2 agents reinforce → severity +1
+    - Any agent conflicts → cap at original severity
+    - All agents silent → no change
+    """
+    original_severity = finding.get("severity", 3)
+    finding_id = finding.get("id", "")
+    
+    if not cross_refs:
+        return original_severity
+    
+    # Count cross-references by relationship type
+    reinforce_count = 0
+    extend_count = 0
+    conflict_count = 0
+    
+    for cross_ref in cross_refs:
+        if cross_ref.get("target_finding_id") == finding_id:
+            relationship = cross_ref.get("relationship", "")
+            if relationship == "reinforce":
+                reinforce_count += 1
+            elif relationship == "extend":
+                extend_count += 1
+            elif relationship == "conflict":
+                conflict_count += 1
+    
+    # If any conflicts, don't boost severity
+    if conflict_count > 0:
+        logger.info(f"Finding {finding_id}: {conflict_count} conflicts, keeping severity {original_severity}")
+        return original_severity
+    
+    # Calculate severity boost based on reinforcements
+    if reinforce_count >= 3:
+        boosted_severity = min(original_severity + 2, 5)
+        logger.info(f"Finding {finding_id}: {reinforce_count} reinforcements, boosting {original_severity} → {boosted_severity}")
+        return boosted_severity
+    elif reinforce_count >= 2:
+        boosted_severity = min(original_severity + 1, 5)
+        logger.info(f"Finding {finding_id}: {reinforce_count} reinforcements, boosting {original_severity} → {boosted_severity}")
+        return boosted_severity
+    elif extend_count >= 2:
+        # Multiple extensions also get a small boost
+        boosted_severity = min(original_severity + 1, 5)
+        logger.info(f"Finding {finding_id}: {extend_count} extensions, boosting {original_severity} → {boosted_severity}")
+        return boosted_severity
+    
+    # No significant consensus
+    return original_severity
+
+
+def apply_consensus_to_findings(findings: List[dict], cross_refs: List[Dict[str, Any]]) -> List[dict]:
+    """
+    Apply consensus severity adjustments to all findings.
+    """
+    adjusted_findings = []
+    
+    for finding in findings:
+        adjusted_finding = finding.copy()
+        original_severity = finding.get("severity", 3)
+        consensus_severity = calculate_consensus_severity(finding, cross_refs)
+        
+        adjusted_finding["original_severity"] = original_severity
+        adjusted_finding["severity"] = consensus_severity
+        
+        if consensus_severity != original_severity:
+            adjusted_finding["consensus_adjusted"] = True
+            logger.info(f"Consensus adjustment: {finding.get('id')} {original_severity} → {consensus_severity}")
+        
+        adjusted_findings.append(adjusted_finding)
+    
+    return adjusted_findings
+
+
 def format_finding_markdown(finding: dict) -> list[str]:
     """Format a single finding as markdown lines."""
     # Build header with source info
     sources = finding.get("_sources", [finding.get("_source", "unknown")])
     source_str = "+".join(s.upper()[:3] for s in sources)
     
-    severity_emoji = {5: "🔴", 4: "🟠", 3: "🟡", 2: "🔵", 1: "⚪"}.get(finding.get("severity", 3), "⚪")
+    severity = finding.get("severity", 3)
+    severity_emoji = {5: "🔴", 4: "🟠", 3: "🟡", 2: "🔵", 1: "⚪"}.get(severity, "⚪")
     
     title = finding.get("title", "Issue")
     # Remove source prefix if already in title to avoid duplication
@@ -226,6 +304,18 @@ def format_finding_markdown(finding: dict) -> list[str]:
     else:
         display_title = f"[{source_str}] {title}"
     
+    # Add confidence if available
+    confidence = finding.get("confidence", 0.8)
+    if confidence >= 0.9:
+        confidence_str = f" ({confidence*100:.0f}% confidence)"
+    elif confidence >= 0.7:
+        confidence_str = f" ({confidence*100:.0f}% confidence)"
+    else:
+        confidence_str = f" ({confidence*100:.0f}% confidence)"
+    
+    # Add consensus adjustment indicator
+    consensus_indicator = " ⚡" if finding.get("consensus_adjusted") else ""
+    
     file_path = finding.get("file_path", "unknown")
     line_start = finding.get("line_start", 0)
     line_end = finding.get("line_end", line_start)
@@ -233,7 +323,7 @@ def format_finding_markdown(finding: dict) -> list[str]:
     line_info = f"Line {line_start}" if line_start == line_end else f"Lines {line_start}-{line_end}"
     
     lines = [
-        f"#### {severity_emoji} {display_title}",
+        f"#### {severity_emoji} {display_title}{confidence_str}{consensus_indicator}",
         f"📁 `{file_path}` • {line_info}",
         "",
     ]
@@ -243,6 +333,14 @@ def format_finding_markdown(finding: dict) -> list[str]:
     if description:
         lines.append(description)
         lines.append("")
+    
+    # Reasoning if available
+    reasoning = finding.get("reasoning", "")
+    if reasoning:
+        lines.extend([
+            f"**🧠 Reasoning:** {reasoning}",
+            ""
+        ])
     
     # Code snippet
     code_snippet = finding.get("code_snippet", "")
@@ -266,6 +364,12 @@ def format_finding_markdown(finding: dict) -> list[str]:
     if finding.get("_merged"):
         count = finding.get("_finding_count", len(sources))
         lines.append(f"*⚡ Flagged by {count} agents: {', '.join(sources)}*")
+        lines.append("")
+    
+    # Consensus adjustment info
+    if finding.get("consensus_adjusted"):
+        original = finding.get("original_severity", severity)
+        lines.append(f"*📈 Severity adjusted by consensus: {original} → {severity}*")
         lines.append("")
     
     lines.append("---")

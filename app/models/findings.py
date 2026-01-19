@@ -16,6 +16,8 @@ class Finding(BaseModel):
     description: str
     suggestion: str = ""
     code_snippet: str = ""
+    confidence: float = Field(ge=0.0, le=1.0, default=0.8)  # Agent confidence
+    reasoning: str = ""  # Why agent flagged this
 
 
 class AgentFindings(BaseModel):

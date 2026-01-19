@@ -7,7 +7,10 @@ from app.integrations.mongodb import get_db
 from app.integrations import github
 from app.models.session import ReviewSession, GitHubContext, FileChange
 from app.agents import run_all_agents
-from app.orchestrator.convergence import merge_overlapping_findings, synthesize_markdown
+from app.orchestrator.convergence import merge_overlapping_findings, synthesize_markdown, apply_consensus_to_findings
+from app.orchestrator.templates import synthesize_with_template
+from app.orchestrator.cross_reference import run_cross_reference_round, get_cross_references_for_session
+from app.orchestrator.file_prioritizer import prioritize_files, should_chunk_pr, chunk_files_for_context
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +18,8 @@ logger = logging.getLogger(__name__)
 async def orchestrate_review(
     session_id: str | None = None,
     payload: dict | None = None,
-    post_to_github: bool = True
+    post_to_github: bool = True,
+    template: str = "default"
 ) -> dict:
     """
     Main orchestration function.
@@ -78,9 +82,15 @@ async def orchestrate_review(
     agents_completed = list(agent_results.keys())
     
     # ─────────────────────────────────────────────────────────
-    # STEP 3: Update Status to Converging
+    # STEP 3: Cross-Reference Round
     # ─────────────────────────────────────────────────────────
     
+    logger.info(f"Starting cross-reference round for session {session_id}")
+    
+    cross_ref_result = await run_cross_reference_round(session_id)
+    cross_references = cross_ref_result.get("cross_references", [])
+    
+    # Update status to cross-referencing
     await db.review_sessions.update_one(
         {"_id": ObjectId(session_id)},
         {
@@ -106,19 +116,47 @@ async def orchestrate_review(
     # Merge overlapping findings
     merged_findings = merge_overlapping_findings(findings_by_agent)
     
+    # Apply consensus severity adjustments
+    if cross_references:
+        logger.info(f"Applying consensus adjustments with {len(cross_references)} cross-references")
+        merged_findings = apply_consensus_to_findings(merged_findings, cross_references)
+    
     # ─────────────────────────────────────────────────────────
     # STEP 5: Synthesize Final Review Markdown
     # ─────────────────────────────────────────────────────────
     
     duration_ms = int((time.time() - start_time) * 1000)
     
-    review_markdown = synthesize_markdown(
-        pr_title=github_ctx["pr_title"],
-        pr_url=github_ctx["pr_url"],
-        findings=merged_findings,
-        agents_completed=agents_completed,
-        duration_ms=duration_ms
-    )
+    # Get agent latencies for template
+    agent_latencies = {}
+    for agent_type, result in agent_results.items():
+        agent_doc = await db.agent_findings.find_one({
+            "session_id": ObjectId(session_id),
+            "agent_type": agent_type
+        })
+        if agent_doc:
+            agent_latencies[agent_type] = agent_doc.get("latency_ms", 0)
+    
+    # Use template system
+    if template == "default":
+        review_markdown = synthesize_markdown(
+            pr_title=github_ctx["pr_title"],
+            pr_url=github_ctx["pr_url"],
+            findings=merged_findings,
+            agents_completed=agents_completed,
+            duration_ms=duration_ms
+        )
+    else:
+        review_markdown = synthesize_with_template(
+            findings=merged_findings,
+            pr_title=github_ctx["pr_title"],
+            pr_url=github_ctx["pr_url"],
+            agents_completed=agents_completed,
+            duration_ms=duration_ms,
+            template_name=template,
+            cross_refs=cross_references,
+            agent_latencies=agent_latencies
+        )
     
     # ─────────────────────────────────────────────────────────
     # STEP 6: Post to GitHub (Optional)

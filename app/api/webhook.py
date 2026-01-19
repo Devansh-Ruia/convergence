@@ -159,7 +159,7 @@ async def analyze_session(session_id: str):
 
 
 @router.post("/sessions/{session_id}/review")
-async def run_full_review(session_id: str, post_to_github: bool = False):
+async def run_full_review(session_id: str, post_to_github: bool = False, template: str = "default"):
     """
     Run the FULL orchestration pipeline on a session.
     - Runs all agents
@@ -167,11 +167,11 @@ async def run_full_review(session_id: str, post_to_github: bool = False):
     - Generates markdown review
     - Optionally posts to GitHub
 
-    Usage: POST /webhook/sessions/{id}/review?post_to_github=true
+    Usage: POST /webhook/sessions/{id}/review?post_to_github=true&template=checklist
     """
     try:
         result = await orchestrate_review(
-            session_id=session_id, post_to_github=post_to_github
+            session_id=session_id, post_to_github=post_to_github, template=template
         )
         return result
     except ValueError as e:

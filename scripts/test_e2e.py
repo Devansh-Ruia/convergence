@@ -77,14 +77,14 @@ async def test_run_agents(session_id: str) -> dict | None:
         return data
 
 
-async def test_full_review(session_id: str) -> dict | None:
+async def test_full_review(session_id: str, template: str = "default") -> dict | None:
     """Run full orchestration pipeline."""
-    print(f"\n🔄 Running full review pipeline...")
+    print(f"\n🔄 Running full review pipeline with template '{template}'...")
     
     async with httpx.AsyncClient(timeout=180.0) as client:
         r = await client.post(
             f"{BASE_URL}/webhook/sessions/{session_id}/review",
-            params={"post_to_github": False}
+            params={"post_to_github": False, "template": template}
         )
         
         if r.status_code != 200:
@@ -140,6 +140,31 @@ async def test_preview_markdown(session_id: str):
         print("="*60)
 
 
+async def test_metrics():
+    """Test metrics endpoint."""
+    print("\n📊 Testing metrics endpoint...")
+    
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{BASE_URL}/api/metrics/summary")
+        
+        if r.status_code != 200:
+            print(f"   ❌ Failed: {r.status_code} - {r.text}")
+            return
+        
+        data = r.json()
+        summary = data.get("summary", {})
+        performance = data.get("agent_performance", {})
+        
+        print(f"   ✅ Metrics retrieved")
+        print(f"   📈 Total reviews: {summary.get('total_reviews', 0)}")
+        print(f"   ⏱️ Avg review time: {summary.get('avg_review_time_s', 0)}s")
+        print(f"   🤖 Avg agent latency: {summary.get('avg_agent_latency_ms', 0)}ms")
+        
+        print("\n   Agent Performance:")
+        for agent, stats in performance.items():
+            print(f"      {agent.title()}: {stats.get('avg_findings', 0)} findings avg, {stats.get('avg_latency_ms', 0)}ms avg")
+
+
 async def run_full_test():
     """Run complete E2E test."""
     print("="*60)
@@ -170,17 +195,26 @@ async def run_full_test():
         if not session_id:
             continue
         
-        # Run full review
-        result = await test_full_review(session_id)
-        
-        if not result:
-            continue
+        # Run full review with different templates
+        templates_to_test = ["default", "minimal", "checklist"]
+        for template in templates_to_test:
+            print(f"\n📋 Testing template: {template}")
+            result = await test_full_review(session_id, template)
+            
+            if not result:
+                continue
+            
+            # Preview markdown for this template
+            await test_preview_markdown(session_id)
+            
+            # Short pause between templates
+            await asyncio.sleep(2)
         
         # Show findings
         await test_get_findings(session_id)
         
-        # Preview markdown
-        await test_preview_markdown(session_id)
+        # Test metrics endpoint
+        await test_metrics()
     
     print("\n" + "="*60)
     print("✅ E2E TEST COMPLETE")

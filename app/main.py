@@ -9,7 +9,7 @@ import os
 from app.config import settings
 from app.integrations.mongodb import connect_db, close_db
 from app.integrations.gemini import init_gemini
-from app.api import health, webhook
+from app.api import health, webhook, events
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +55,7 @@ app.add_middleware(
 # Include routers
 app.include_router(health.router, tags=["health"])
 app.include_router(webhook.router, prefix="/webhook", tags=["webhook"])
+app.include_router(events.router, prefix="/api", tags=["events"])
 
 # Serve static files (dashboard)
 static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")

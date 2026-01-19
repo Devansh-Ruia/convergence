@@ -37,6 +37,17 @@ async def connect_db() -> None:
     ], unique=True)
     await _db.agent_findings.create_index([("session_id", 1)])
     
+    # Indexes for cross-references collection
+    await _db.agent_cross_references.create_index([
+        ("session_id", 1),
+        ("source_agent", 1)
+    ])
+    await _db.agent_cross_references.create_index([
+        ("session_id", 1),
+        ("target_finding_id", 1)
+    ])
+    await _db.agent_cross_references.create_index([("created_at", -1)])
+    
     logger.info("MongoDB indexes created")
 
 

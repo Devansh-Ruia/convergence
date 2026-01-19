@@ -13,13 +13,17 @@ from app.agents.base import BaseAgent
 from app.agents.security import SecurityAgent
 from app.agents.performance import PerformanceAgent
 from app.agents.testing import TestingAgent
+from app.agents.architecture import ArchitectureAgent
+from app.agents.documentation import DocumentationAgent
 
 logger = logging.getLogger(__name__)
 
 AGENT_CLASSES: dict[str, type[BaseAgent]] = {
     "security": SecurityAgent,
     "performance": PerformanceAgent,
-    "testing": TestingAgent
+    "testing": TestingAgent,
+    "architecture": ArchitectureAgent,
+    "documentation": DocumentationAgent
 }
 
 
